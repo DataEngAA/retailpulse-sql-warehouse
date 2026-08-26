@@ -6,27 +6,129 @@
 --   - New customers
 --   - Type 1 changes
 --   - Multiple SCD2 changes/customer/run
---   - No-op snapshots
+--   - SCD2 no-op snapshots
+--   - Empty batches
+--   - Durable RUNNING audit record
+--   - Transactional SUCCESS audit
 --
--- Does NOT yet support:
---   - Late-arriving historical versions
+-- Safety:
+--   - Late-arriving snapshot guard
+--   - Same-time SCD2 conflict guard
+--   - Invalid-period guard
+--   - Monotonic watermark
+--   - Concurrent pipeline protection
+--
+-- Failed-run behaviour:
+--   - RUNNING audit record survives ETL rollback
+--   - stale RUNNING records will later be reconciled to FAILED
 -- ============================================================
 
+
+\set ON_ERROR_STOP on
+
+
+-- ============================================================
+-- SESSION CONTEXT
+--
+-- This TEMP table must survive Transaction A's COMMIT so
+-- Transaction B still knows which audit run it belongs to.
+-- ============================================================
+
+DROP TABLE IF EXISTS tmp_run_context;
+
+
+CREATE TEMP TABLE tmp_run_context (
+
+    run_id BIGINT NOT NULL,
+
+    watermark_before BIGINT
+
+)
+ON COMMIT PRESERVE ROWS;
+
+
+
+-- ============================================================
+-- TRANSACTION A
+-- Create durable RUNNING audit record
+-- ============================================================
 
 BEGIN;
 
 
+WITH new_run AS (
+
+    INSERT INTO audit.etl_runs (
+        pipeline_name,
+        status,
+        watermark_before
+    )
+
+    VALUES (
+        'dim_customer_incremental',
+        'RUNNING',
+        NULL
+    )
+
+    RETURNING run_id
+
+)
+
+INSERT INTO tmp_run_context (
+    run_id
+)
+
+SELECT run_id
+FROM new_run;
+
+
+COMMIT;
+
+
+
 -- ============================================================
--- 1. Lock pipeline watermark
+-- At this point:
 --
--- Prevents two copies of this ETL from processing the same
--- watermark simultaneously.
+-- RUNNING audit row is permanently committed.
+--
+-- If the ETL transaction below fails, this record survives.
 -- ============================================================
 
-SELECT last_processed_version_id
-FROM control.pipeline_watermark
-WHERE pipeline_name = 'dim_customer_incremental'
-FOR UPDATE;
+
+
+-- ============================================================
+-- TRANSACTION B
+-- Actual warehouse ETL
+-- ============================================================
+
+BEGIN;
+
+
+
+-- ============================================================
+-- 1. Lock pipeline watermark and capture starting boundary
+-- ============================================================
+
+WITH locked_watermark AS (
+
+    SELECT
+        last_processed_version_id
+
+    FROM control.pipeline_watermark
+
+    WHERE pipeline_name = 'dim_customer_incremental'
+
+    FOR UPDATE
+)
+
+UPDATE tmp_run_context r
+
+SET
+    watermark_before = w.last_processed_version_id
+
+FROM locked_watermark w;
+
+
 
 -- ============================================================
 -- 2. Capture all unprocessed staging versions
@@ -50,23 +152,26 @@ FROM staging.stg_customer_versions s
 
 WHERE s.customer_version_id >
 (
-    SELECT last_processed_version_id
-    FROM control.pipeline_watermark
-    WHERE pipeline_name = 'dim_customer_incremental'
+    SELECT watermark_before
+    FROM tmp_run_context
 );
 
+
+
 -- ============================================================
--- 3. Safety guard: reject late-arriving versions
+-- 3. Safety guard: late-arriving snapshots
 --
--- V2 only appends history after the current warehouse version.
--- Historical corrections will be handled in a later version.
+-- V2 supports append-only historical processing.
+-- Older historical corrections are deferred to V3.
 -- ============================================================
 
 CREATE TEMP TABLE tmp_late_arrival_guard (
+
     violation_count INTEGER NOT NULL,
 
     CONSTRAINT no_late_arriving_versions
         CHECK (violation_count = 0)
+
 )
 ON COMMIT DROP;
 
@@ -75,7 +180,7 @@ INSERT INTO tmp_late_arrival_guard (
     violation_count
 )
 
-SELECT COUNT(*)
+SELECT COUNT(*)::INTEGER
 
 FROM tmp_batch b
 
@@ -85,16 +190,20 @@ JOIN warehouse.dim_customer d
 
 WHERE b.effective_at <= d.valid_from;
 
+
+
 -- ============================================================
--- 4. Safety guard: reject conflicting SCD2 states at
---    exactly the same effective timestamp
+-- 4. Safety guard:
+-- conflicting SCD2 states at same business timestamp
 -- ============================================================
 
 CREATE TEMP TABLE tmp_same_time_guard (
+
     violation_count INTEGER NOT NULL,
 
     CONSTRAINT no_ambiguous_same_time_scd2_versions
         CHECK (violation_count = 0)
+
 )
 ON COMMIT DROP;
 
@@ -103,14 +212,16 @@ INSERT INTO tmp_same_time_guard (
     violation_count
 )
 
-SELECT COUNT(*)
+SELECT COUNT(*)::INTEGER
 
 FROM (
+
     SELECT
         customer_id,
         effective_at
 
     FROM (
+
         SELECT DISTINCT
             customer_id,
             effective_at,
@@ -121,6 +232,7 @@ FROM (
             customer_status
 
         FROM tmp_batch
+
     ) distinct_states
 
     GROUP BY
@@ -129,16 +241,18 @@ FROM (
 
     HAVING COUNT(*) > 1
 
-) violations;
+) conflicts;
+
+
 
 -- ============================================================
 -- 5. Detect real SCD2 changes
 --
 -- First incoming version:
---     compare against current warehouse state.
+--     compare with current warehouse state.
 --
 -- Later versions:
---     compare against previous staging version in the batch.
+--     compare with previous version using LAG().
 -- ============================================================
 
 CREATE TEMP TABLE tmp_scd2_changes
@@ -153,44 +267,59 @@ WITH with_predecessors AS (
         d.customer_sk AS warehouse_customer_sk,
 
         CASE
-            WHEN b.batch_seq = 1 THEN d.city
+            WHEN b.batch_seq = 1
+                THEN d.city
+
             ELSE LAG(b.city) OVER (
                 PARTITION BY b.customer_id
                 ORDER BY b.batch_seq
             )
         END AS prev_city,
 
+
         CASE
-            WHEN b.batch_seq = 1 THEN d.state
+            WHEN b.batch_seq = 1
+                THEN d.state
+
             ELSE LAG(b.state) OVER (
                 PARTITION BY b.customer_id
                 ORDER BY b.batch_seq
             )
         END AS prev_state,
 
+
         CASE
-            WHEN b.batch_seq = 1 THEN d.country
+            WHEN b.batch_seq = 1
+                THEN d.country
+
             ELSE LAG(b.country) OVER (
                 PARTITION BY b.customer_id
                 ORDER BY b.batch_seq
             )
         END AS prev_country,
 
+
         CASE
-            WHEN b.batch_seq = 1 THEN d.postal_code
+            WHEN b.batch_seq = 1
+                THEN d.postal_code
+
             ELSE LAG(b.postal_code) OVER (
                 PARTITION BY b.customer_id
                 ORDER BY b.batch_seq
             )
         END AS prev_postal_code,
 
+
         CASE
-            WHEN b.batch_seq = 1 THEN d.customer_status
+            WHEN b.batch_seq = 1
+                THEN d.customer_status
+
             ELSE LAG(b.customer_status) OVER (
                 PARTITION BY b.customer_id
                 ORDER BY b.batch_seq
             )
         END AS prev_customer_status
+
 
     FROM tmp_batch b
 
@@ -199,6 +328,7 @@ WITH with_predecessors AS (
        AND d.is_current = TRUE
 ),
 
+
 real_changes AS (
 
     SELECT *
@@ -206,19 +336,21 @@ real_changes AS (
     FROM with_predecessors
 
     WHERE
-        -- First ever warehouse version for a new customer
+
+        -- First version of completely new customer
         (
             batch_seq = 1
             AND warehouse_customer_sk IS NULL
         )
 
-        -- Existing customer whose SCD2 state changed
+        -- Existing customer SCD2 changes
         OR city IS DISTINCT FROM prev_city
         OR state IS DISTINCT FROM prev_state
         OR country IS DISTINCT FROM prev_country
         OR postal_code IS DISTINCT FROM prev_postal_code
         OR customer_status IS DISTINCT FROM prev_customer_status
 ),
+
 
 periodized AS (
 
@@ -227,29 +359,39 @@ periodized AS (
 
         ROW_NUMBER() OVER (
             PARTITION BY customer_id
-            ORDER BY effective_at, customer_version_id
+            ORDER BY
+                effective_at,
+                customer_version_id
         ) AS change_seq,
+
 
         LEAD(effective_at) OVER (
             PARTITION BY customer_id
-            ORDER BY effective_at, customer_version_id
+            ORDER BY
+                effective_at,
+                customer_version_id
         ) AS next_effective_at
 
     FROM real_changes
 )
 
+
 SELECT *
 FROM periodized;
 
+
+
 -- ============================================================
--- 6. Safety guard: SCD2 periods must have positive duration
+-- 6. Safety guard: invalid / zero-duration periods
 -- ============================================================
 
 CREATE TEMP TABLE tmp_invalid_period_guard (
+
     violation_count INTEGER NOT NULL,
 
     CONSTRAINT no_invalid_scd2_periods
         CHECK (violation_count = 0)
+
 )
 ON COMMIT DROP;
 
@@ -258,18 +400,20 @@ INSERT INTO tmp_invalid_period_guard (
     violation_count
 )
 
-SELECT COUNT(*)
+SELECT COUNT(*)::INTEGER
 
 FROM tmp_scd2_changes
 
 WHERE next_effective_at IS NOT NULL
   AND next_effective_at <= effective_at;
 
+
+
 -- ============================================================
--- 7. Close the existing current warehouse row
+-- 7. Close previous current warehouse row
 --
--- Only the FIRST real SCD2 change for each existing customer
--- closes the row that was current before this ETL run.
+-- Only first real SCD2 change closes the row that was current
+-- before this batch.
 -- ============================================================
 
 UPDATE warehouse.dim_customer d
@@ -285,11 +429,14 @@ WHERE c.change_seq = 1
   AND d.customer_sk = c.warehouse_customer_sk
   AND d.is_current = TRUE;
 
+
+
 -- ============================================================
--- 8. Insert all new SCD2 versions
+-- 8. Insert entire new SCD2 chain
 -- ============================================================
 
 INSERT INTO warehouse.dim_customer (
+
     customer_id,
 
     first_name,
@@ -310,9 +457,11 @@ INSERT INTO warehouse.dim_customer (
     is_current,
 
     source_raw_record_id
+
 )
 
 SELECT
+
     customer_id,
 
     first_name,
@@ -340,11 +489,14 @@ ORDER BY
     customer_id,
     change_seq;
 
-    -- ============================================================
--- 9. Capture latest incoming snapshot per customer
+
+
+-- ============================================================
+-- 9. Latest incoming snapshot/customer for Type 1
 --
--- Type 1 attributes come from the latest batch version even
--- when the batch contains no SCD2 change.
+-- IMPORTANT:
+-- use tmp_batch rather than tmp_scd2_changes.
+-- Pure Type1 changes must still be processed.
 -- ============================================================
 
 CREATE TEMP TABLE tmp_latest_type1
@@ -352,7 +504,9 @@ ON COMMIT DROP
 AS
 
 SELECT *
+
 FROM (
+
     SELECT
         b.*,
 
@@ -369,9 +523,10 @@ FROM (
 
 WHERE latest_rank = 1;
 
+
+
 -- ============================================================
--- 10. Apply latest Type 1 attributes across all historical
---     rows for each affected customer.
+-- 10. Apply latest Type 1 attributes
 -- ============================================================
 
 UPDATE warehouse.dim_customer d
@@ -388,28 +543,135 @@ FROM tmp_latest_type1 t
 
 WHERE d.customer_id = t.customer_id;
 
+
+
 -- ============================================================
--- 11. Advance watermark only after warehouse processing
---     has succeeded.
+-- 11. Advance watermark
+--
+-- Empty batch:
+--     no update
+--
+-- Existing watermark:
+--     never moves backwards
 -- ============================================================
 
 UPDATE control.pipeline_watermark w
 
 SET
     last_processed_version_id = x.max_version_id,
-    updated_at = CURRENT_TIMESTAMP
+
+    updated_at = clock_timestamp()
 
 FROM (
-    SELECT MAX(customer_version_id) AS max_version_id
+
+    SELECT
+        MAX(customer_version_id) AS max_version_id
+
     FROM tmp_batch
+
 ) x
 
 WHERE w.pipeline_name = 'dim_customer_incremental'
-  AND x.max_version_id IS NOT NULL
-  AND x.max_version_id > w.last_processed_version_id;
 
-  -- ============================================================
--- 12. Commit the entire ETL batch
+  AND x.max_version_id IS NOT NULL
+
+  AND x.max_version_id >
+      w.last_processed_version_id;
+
+
+
+-- ============================================================
+-- 12. Mark durable audit record SUCCESS
+--
+-- This happens INSIDE the same transaction as:
+--
+-- warehouse changes
+-- watermark changes
+--
+-- Therefore they commit atomically.
+-- ============================================================
+
+UPDATE audit.etl_runs e
+
+SET
+    finished_at = clock_timestamp(),
+
+    status = 'SUCCESS',
+
+    watermark_before = r.watermark_before,
+
+    watermark_after =
+        w.last_processed_version_id,
+
+    rows_in_batch = (
+        SELECT COUNT(*)::INTEGER
+        FROM tmp_batch
+    ),
+
+    scd2_rows_inserted = (
+        SELECT COUNT(*)::INTEGER
+        FROM tmp_scd2_changes
+    ),
+
+    type1_customers_affected = (
+        SELECT COUNT(*)::INTEGER
+        FROM tmp_latest_type1
+    ),
+
+    error_message = NULL
+
+
+FROM tmp_run_context r
+
+JOIN control.pipeline_watermark w
+    ON w.pipeline_name =
+       'dim_customer_incremental'
+
+WHERE e.run_id = r.run_id;
+
+
+
+-- ============================================================
+-- 13. Commit warehouse + watermark + SUCCESS audit
 -- ============================================================
 
 COMMIT;
+
+
+
+-- ============================================================
+-- 14. Display persisted run result
+-- ============================================================
+
+SELECT
+    e.run_id,
+    e.pipeline_name,
+    e.status,
+
+    e.started_at,
+    e.finished_at,
+
+    e.watermark_before,
+    e.watermark_after,
+
+    e.rows_in_batch,
+    e.scd2_rows_inserted,
+    e.type1_customers_affected,
+
+    e.error_message
+
+FROM audit.etl_runs e
+
+JOIN tmp_run_context r
+    ON e.run_id = r.run_id;
+
+
+
+-- ============================================================
+-- 15. Clean session context after successful run
+-- ============================================================
+
+DROP TABLE tmp_run_context;
+
+
+\set ON_ERROR_STOP off
